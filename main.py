@@ -34,11 +34,22 @@ app.add_middleware(
 DB_NAME = "sentinelflow.db"
 
 # SMTP Environment Configuration
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-DEFAULT_ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT_EMAIL", "operator@sentinelflow.local")
+SMTP_HOST_RAW = os.getenv("SMTP_HOST", "").strip()
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASSWORD_RAW = os.getenv("SMTP_PASSWORD", "").strip()
+SMTP_PASSWORD = SMTP_PASSWORD_RAW.strip("\"'").replace(" ", "")
+try:
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+except ValueError:
+    SMTP_PORT = 587
+
+# Auto-correct if user accidentally set email as host (e.g. shantalahotagi@gmail.com)
+if not SMTP_HOST_RAW or "@" in SMTP_HOST_RAW:
+    SMTP_HOST = "smtp.gmail.com"
+else:
+    SMTP_HOST = SMTP_HOST_RAW
+
+DEFAULT_ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT_EMAIL", "").strip() or SMTP_USER or "operator@sentinelflow.local"
 
 
 def get_db_connection():
@@ -189,6 +200,13 @@ SentinelFlow SCADA Anomaly Detection System — Automated Dispatch
                 server.send_message(msg)
             status = "SENT"
             details = f"Email successfully delivered to {recipient} via {SMTP_HOST}:{SMTP_PORT}."
+        except smtplib.SMTPAuthenticationError:
+            status = "FAILED"
+            details = (
+                "Gmail 535 Error: Username or password not accepted. "
+                "With Gmail, you must use a 16-character 'App Password' (not your personal Google account password). "
+                "Generate one at: https://myaccount.google.com/apppasswords"
+            )
         except Exception as e:
             status = "FAILED"
             details = f"SMTP transmission failed: {str(e)}"
@@ -288,6 +306,13 @@ SentinelFlow SCADA Anomaly Detection System — Automated Dispatch
                 server.send_message(msg)
             status = "SENT"
             details = f"Email successfully delivered to {recipient} via {SMTP_HOST}:{SMTP_PORT}."
+        except smtplib.SMTPAuthenticationError:
+            status = "FAILED"
+            details = (
+                "Gmail 535 Error: Username or password not accepted. "
+                "With Gmail, you must use a 16-character 'App Password' (not your personal Google account password). "
+                "Generate one at: https://myaccount.google.com/apppasswords"
+            )
         except Exception as e:
             status = "FAILED"
             details = f"SMTP transmission failed: {str(e)}"
