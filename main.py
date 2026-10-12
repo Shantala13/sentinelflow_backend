@@ -3,6 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import sqlite3
 import io
+import os
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 app = FastAPI(
@@ -24,10 +28,17 @@ app.add_middleware(
 )
 
 # --------------------------------------------------
-# DATABASE
+# DATABASE & SETTINGS
 # --------------------------------------------------
 
 DB_NAME = "sentinelflow.db"
+
+# SMTP Environment Configuration
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+DEFAULT_ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT_EMAIL", "operator@sentinelflow.local")
 
 
 def get_db_connection():
@@ -39,6 +50,8 @@ def get_db_connection():
 def init_database():
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # SCADA telemetry readings table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS scada_readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,11 +68,257 @@ def init_database():
             anomaly_message TEXT
         )
     """)
+
+    # Email alerts dispatch history table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS email_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            reading_id INTEGER,
+            recipient TEXT,
+            subject TEXT,
+            severity TEXT,
+            message_body TEXT,
+            status TEXT,
+            details TEXT
+        )
+    """)
+
+    # System configuration settings table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
 
 
 init_database()
+
+
+def get_setting(key: str, default: str) -> str:
+    try:
+        conn = get_db_connection()
+        row = conn.cursor().execute("SELECT value FROM system_settings WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def set_setting(key: str, value: str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+
+# --------------------------------------------------
+# EMAIL DISPATCH SERVICE
+# --------------------------------------------------
+
+def send_email_alert(
+    reading_id: int,
+    severity: str,
+    anomalies: list,
+    data: dict,
+    timestamp: str = None,
+    recipient: str = None
+):
+    if not recipient:
+        recipient = get_setting("alert_recipient_email", DEFAULT_ALERT_RECIPIENT)
+
+    if not timestamp:
+        timestamp = datetime.now().isoformat()
+
+    subject = f"[SentinelFlow SCADA ALERT] {severity} Condition Detected - Telemetry #{reading_id}"
+
+    action_guidance = (
+        "CRITICAL ALERT: Multiple concurrent threshold violations detected.\n"
+        "Immediate pump shutdown and manual valve inspection recommended to prevent system failure."
+        if severity == "CRITICAL"
+        else "WARNING: Abnormal sensor threshold detected.\n"
+        "Inspect telemetry logs and calibrate the affected subsystem."
+    )
+
+    body = f"""======================================================================
+SENTINELFLOW — SCADA AUTOMATED OPERATOR ALERT
+======================================================================
+Severity Level : {severity}
+Reading ID     : #{reading_id}
+Timestamp      : {timestamp}
+Recipient      : {recipient}
+
+DETECTED ANOMALIES:
+""" + "\n".join([f"  • {item}" for item in anomalies]) + f"""
+
+SENSOR METRICS RECORDED AT EVENT:
+  • Pressure        : {data.get('pressure')} bar  (Normal: 2.5–5.0 bar)
+  • Flow Rate       : {data.get('flow_rate')} L/min  (Normal: 80–140 L/min)
+  • Temperature     : {data.get('temperature')} °C  (Normal: 19–25 °C)
+  • Pump Vibration  : {data.get('vibration')} mm/s  (Normal: ≤ 1.8 mm/s)
+  • Pump Current    : {data.get('current')} A  (Normal: ≤ 10 A)
+  • Water pH        : {data.get('ph')}  (Normal: 6.5–8.0)
+  • Tank Level      : {data.get('tank_level')}%  (Normal: 20–90%)
+
+ACTION REQUIRED:
+{action_guidance}
+
+======================================================================
+SentinelFlow SCADA Anomaly Detection System — Automated Dispatch
+"""
+
+    status = "SIMULATED"
+    details = "Alert generated and logged. Live SMTP requires SMTP_USER and SMTP_PASSWORD in environment."
+
+    if SMTP_USER and SMTP_PASSWORD:
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = SMTP_USER
+            msg["To"] = recipient
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+            status = "SENT"
+            details = f"Email successfully delivered to {recipient} via {SMTP_HOST}:{SMTP_PORT}."
+        except Exception as e:
+            status = "FAILED"
+            details = f"SMTP transmission failed: {str(e)}"
+
+    # Record dispatch in database
+    try:
+        conn = get_db_connection()
+        conn.cursor().execute("""
+            INSERT INTO email_alerts (
+                timestamp,
+                reading_id,
+                recipient,
+                subject,
+                severity,
+                message_body,
+                status,
+                details
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (timestamp, reading_id, recipient, subject, severity, body, status, details))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error persisting email alert to DB: {e}")
+
+    return {
+        "sent": status == "SENT",
+        "status": status,
+        "recipient": recipient,
+        "subject": subject,
+        "details": details
+    }
+
+
+def send_batch_upload_email(
+    filename: str,
+    summary: dict,
+    faulty_samples: list,
+    recipient: str = None
+):
+    if not recipient:
+        recipient = get_setting("alert_recipient_email", DEFAULT_ALERT_RECIPIENT)
+
+    timestamp = datetime.now().isoformat()
+    critical_count = summary.get("critical_count", 0)
+    warning_count = summary.get("warning_count", 0)
+    total_anomalies = summary.get("faulty_readings_count", 0)
+
+    severity = "CRITICAL" if critical_count > 0 else "WARNING"
+    subject = f"[SentinelFlow SCADA ALERT] Batch Upload Matrix Detected {total_anomalies} Anomalies in '{filename}'"
+
+    fault_summary_lines = []
+    for f in faulty_samples[:10]:
+        anom_desc = ", ".join(f.get("anomalies", []))
+        fault_summary_lines.append(
+            f"  • Row {f.get('row_number')} (DB #{f.get('reading_id')}): [{f.get('status')}] {anom_desc}"
+        )
+
+    if len(faulty_samples) > 10:
+        fault_summary_lines.append(f"  • ... and {len(faulty_samples) - 10} additional anomaly records.")
+
+    body = f"""======================================================================
+SENTINELFLOW — BATCH UPLOAD SCADA AUDIT ALERT
+======================================================================
+Filename       : {filename}
+Timestamp      : {timestamp}
+Recipient      : {recipient}
+Total Records  : {summary.get('total_records', 0)}
+Normal Records : {summary.get('normal_count', 0)}
+Warnings       : {warning_count}
+Critical Events: {critical_count}
+
+DETECTED ANOMALOUS LOGS (SAMPLE):
+""" + "\n".join(fault_summary_lines) + f"""
+
+OPERATOR NOTICE:
+Batch ingestion detected {total_anomalies} abnormal telemetry events.
+Review the dashboard Alerts & History section to evaluate complete telemetry matrices.
+======================================================================
+SentinelFlow SCADA Anomaly Detection System — Automated Dispatch
+"""
+
+    status = "SIMULATED"
+    details = "Batch alert generated and logged. Live SMTP requires SMTP_USER and SMTP_PASSWORD in environment."
+
+    if SMTP_USER and SMTP_PASSWORD:
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = SMTP_USER
+            msg["To"] = recipient
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as server:
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASSWORD)
+                server.send_message(msg)
+            status = "SENT"
+            details = f"Email successfully delivered to {recipient} via {SMTP_HOST}:{SMTP_PORT}."
+        except Exception as e:
+            status = "FAILED"
+            details = f"SMTP transmission failed: {str(e)}"
+
+    try:
+        conn = get_db_connection()
+        conn.cursor().execute("""
+            INSERT INTO email_alerts (
+                timestamp,
+                reading_id,
+                recipient,
+                subject,
+                severity,
+                message_body,
+                status,
+                details
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (timestamp, 0, recipient, subject, severity, body, status, details))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error persisting batch email alert to DB: {e}")
+
+    return {
+        "sent": status == "SENT",
+        "status": status,
+        "recipient": recipient,
+        "subject": subject,
+        "details": details
+    }
 
 
 # --------------------------------------------------
@@ -210,6 +469,17 @@ async def ingest_scada(
     reading_id = cursor.lastrowid
     conn.close()
 
+    # Trigger immediate email alert on WARNING or CRITICAL anomaly
+    email_alert_info = None
+    if status in ("WARNING", "CRITICAL"):
+        email_alert_info = send_email_alert(
+            reading_id=reading_id,
+            severity=status,
+            anomalies=anomalies,
+            data=data,
+            timestamp=timestamp
+        )
+
     return {
         "success": True,
         "reading_id": reading_id,
@@ -217,7 +487,8 @@ async def ingest_scada(
         "status": status,
         "anomaly": bool(anomaly),
         "anomalies": anomalies,
-        "message": message
+        "message": message,
+        "email_alert": email_alert_info
     }
 
 
@@ -264,7 +535,6 @@ async def upload_scada_file(
             if "Sensor Readings" in excel_file.sheet_names:
                 df = pd.read_excel(excel_file, sheet_name="Sensor Readings")
             else:
-                # Find first sheet with required columns
                 matched_sheet = None
                 for sheet in excel_file.sheet_names:
                     temp_df = pd.read_excel(excel_file, sheet_name=sheet, nrows=5)
@@ -305,7 +575,6 @@ async def upload_scada_file(
             }
         )
 
-    # Validate rows and prepare records
     rows_to_insert = []
     results = []
     normal_count = 0
@@ -313,7 +582,7 @@ async def upload_scada_file(
     critical_count = 0
 
     for idx, row in df.iterrows():
-        row_num = idx + 2  # 1-based index including header
+        row_num = idx + 2
         row_data = {}
 
         for col in required_columns:
@@ -331,7 +600,6 @@ async def upload_scada_file(
                     detail=f"Validation error at row {row_num}: '{col}' must be a valid number, got '{val}'."
                 )
 
-        # Optional timestamp column
         timestamp_val = row.get("timestamp")
         if pd.isna(timestamp_val) or str(timestamp_val).strip() == "":
             ts = datetime.now().isoformat()
@@ -365,7 +633,6 @@ async def upload_scada_file(
             row_data
         ))
 
-    # Save all valid rows to SQLite in a single transaction
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -420,6 +687,16 @@ async def upload_scada_file(
         "faulty_readings_count": faulty_readings_count
     }
 
+    # Dispatch batch anomaly alert if anomalies were detected
+    batch_email_info = None
+    if faulty_readings_count > 0:
+        anom_results = [r for r in results if r["anomaly"]]
+        batch_email_info = send_batch_upload_email(
+            filename=file.filename,
+            summary=summary,
+            faulty_samples=anom_results
+        )
+
     return {
         "success": True,
         "filename": file.filename,
@@ -429,6 +706,7 @@ async def upload_scada_file(
         "critical_count": critical_count,
         "faulty_readings_count": faulty_readings_count,
         "summary": summary,
+        "email_alert": batch_email_info,
         "results": results
     }
 
@@ -450,7 +728,6 @@ def get_readings():
     rows = cursor.fetchall()
     conn.close()
 
-    # Convert rows to dicts with named properties
     readings = [dict(row) for row in rows]
 
     return {
@@ -482,4 +759,85 @@ def get_alerts():
     return {
         "count": len(alerts),
         "alerts": alerts
+    }
+
+
+# --------------------------------------------------
+# EMAIL CONFIGURATION & ALERTS HISTORY APIS
+# --------------------------------------------------
+
+@app.get("/api/v1/scada/email-config")
+def get_email_config():
+    recipient = get_setting("alert_recipient_email", DEFAULT_ALERT_RECIPIENT)
+    return {
+        "recipient": recipient,
+        "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
+        "smtp_host": SMTP_HOST,
+        "smtp_port": SMTP_PORT,
+        "smtp_sender": SMTP_USER if SMTP_USER else "Not configured (Simulation mode active)"
+    }
+
+
+@app.post("/api/v1/scada/email-config")
+def update_email_config(
+    recipient: str = Form(...)
+):
+    clean_email = recipient.strip()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(status_code=400, detail="Please provide a valid email address.")
+    set_setting("alert_recipient_email", clean_email)
+    return {
+        "success": True,
+        "recipient": clean_email,
+        "message": f"Alert notification recipient updated to {clean_email}"
+    }
+
+
+@app.get("/api/v1/scada/email-alerts")
+def get_email_alerts():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *
+        FROM email_alerts
+        ORDER BY id DESC
+        LIMIT 50
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    return {
+        "count": len(rows),
+        "alerts": [dict(r) for r in rows]
+    }
+
+
+@app.post("/api/v1/scada/email-alerts/test")
+def test_email_alert(
+    recipient: str = Form(None)
+):
+    target = recipient.strip() if recipient else get_setting("alert_recipient_email", DEFAULT_ALERT_RECIPIENT)
+    sample_data = {
+        "pressure": 5.8,
+        "flow_rate": 65.0,
+        "temperature": 26.5,
+        "vibration": 2.4,
+        "current": 11.2,
+        "ph": 5.8,
+        "tank_level": 95.0
+    }
+    result = send_email_alert(
+        reading_id=999,
+        severity="CRITICAL",
+        anomalies=[
+            "High pressure detected: 5.8 bar",
+            "Abnormal pump vibration: 2.4 mm/s",
+            "Pump overload detected: 11.2 A"
+        ],
+        data=sample_data,
+        recipient=target
+    )
+    return {
+        "success": True,
+        "result": result
     }
