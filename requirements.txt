@@ -5,3 +5,4 @@ numpy
 scikit-learn
 sqlalchemy
 python-multipart
+openpyxl
