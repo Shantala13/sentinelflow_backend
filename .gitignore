@@ -9,3 +9,8 @@ env/
 ENV/
 .idea/
 .vscode/
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3

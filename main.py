@@ -1,13 +1,33 @@
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 import pandas as pd
 import sqlite3
 import io
 import os
 import smtplib
+import sys
+
+from pathlib import Path
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+
+# Backend directory and ML package path
+BACKEND_DIR = Path(__file__).resolve().parent
+
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+# Import ML prediction integration
+from SentinelFlow_ML.integration import safe_predict_scada_reading
+
+# Initialize FastAPI application
+app = FastAPI(
+    title="SentinelFlow Backend",
+    description="SCADA monitoring and anomaly detection API",
+)
 
 app = FastAPI(
     title="SentinelFlow Backend",
@@ -444,9 +464,11 @@ async def ingest_scada(
         "ph": ph,
         "tank_level": tank_level
     }
+    ml_prediction = safe_predict_scada_reading(data)
 
     status, anomalies = detect_anomaly(data)
-
+    # ML-based fault prediction
+    ml_result = safe_predict_scada_reading(data)
     if timestamp is None or str(timestamp).strip() == "":
         timestamp = datetime.now().isoformat()
 
@@ -506,15 +528,29 @@ async def ingest_scada(
         )
 
     return {
-        "success": True,
-        "reading_id": reading_id,
-        "timestamp": timestamp,
-        "status": status,
-        "anomaly": bool(anomaly),
-        "anomalies": anomalies,
-        "message": message,
-        "email_alert": email_alert_info
-    }
+    "success": True,
+    "reading_id": reading_id,
+    "timestamp": timestamp,
+
+    # Rule-based detection
+    "status": status,
+    "anomaly": bool(anomaly),
+    "anomalies": anomalies,
+
+    # Machine Learning prediction
+    "ml_prediction": {
+        "status": ml_result.get("status"),
+        "predicted_fault": ml_result.get("predicted_fault"),
+        "confidence": ml_result.get("confidence"),
+        "confidence_percentage": ml_result.get("confidence_percentage"),
+        "prediction_probabilities": ml_result.get("prediction_probabilities"),
+        "isolation_forest_anomaly": ml_result.get("isolation_forest_anomaly"),
+        "isolation_forest_status": ml_result.get("isolation_forest_status")
+    },
+
+    "message": message,
+    "email_alert": email_alert_info
+}
 
 
 # --------------------------------------------------
